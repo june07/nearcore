@@ -17,8 +17,8 @@ use near_primitives::transaction::{
 };
 use near_primitives::trie_key::TrieKey;
 use near_primitives::types::{
-    AccountId, Balance, BlockHeight, BlockHeightDelta, EpochHeight, Gas, MerkleHash, Nonce,
-    RawStateChangesWithTrieKey, ShardId, StateChangeCause, StateRoot, ValidatorStake,
+    AccountId, Balance, BlockHeight, EpochHeight, EpochId, EpochInfoProvider, Gas, MerkleHash,
+    Nonce, RawStateChangesWithTrieKey, ShardId, StateChangeCause, StateRoot, ValidatorStake,
 };
 use near_primitives::utils::{create_nonce_with_nonce, system_account};
 use near_store::{
@@ -38,7 +38,7 @@ use crate::config::{
     total_prepaid_gas, RuntimeConfig,
 };
 use crate::verifier::validate_receipt;
-pub use crate::verifier::verify_and_charge_transaction;
+pub use crate::verifier::{validate_transaction, verify_and_charge_transaction};
 
 mod actions;
 pub mod adapter;
@@ -57,8 +57,10 @@ pub struct ApplyState {
     /// Currently building block height.
     // TODO #1903 pub block_height: BlockHeight,
     pub block_index: BlockHeight,
-    /// Current epoch length.
-    pub epoch_length: BlockHeightDelta,
+    /// Prev block hash
+    pub last_block_hash: CryptoHash,
+    /// Current epoch id
+    pub epoch_id: EpochId,
     /// Current epoch height
     pub epoch_height: EpochHeight,
     /// Price for the gas.
@@ -273,6 +275,7 @@ impl Runtime {
         promise_results: &[PromiseResult],
         action_hash: CryptoHash,
         is_last_action: bool,
+        epoch_info_provider: &dyn EpochInfoProvider,
     ) -> Result<ActionResult, RuntimeError> {
         let mut result = ActionResult::default();
         let exec_fees = exec_fee(&self.config.transaction_costs, action);
@@ -326,11 +329,23 @@ impl Runtime {
                     &action_hash,
                     &self.config,
                     is_last_action,
+                    epoch_info_provider,
                 )?;
             }
             Action::Transfer(transfer) => {
                 near_metrics::inc_counter(&metrics::ACTION_TRANSFER_TOTAL);
                 action_transfer(account.as_mut().expect(EXPECT_ACCOUNT_EXISTS), transfer)?;
+                // Check if this is a gas refund, then try to refund the access key allowance.
+                if receipt.predecessor_id == system_account()
+                    && action_receipt.signer_id == receipt.receiver_id
+                {
+                    try_refund_allowance(
+                        state_update,
+                        &receipt.receiver_id,
+                        &action_receipt.signer_public_key,
+                        transfer,
+                    )?;
+                }
             }
             Action::Stake(stake) => {
                 near_metrics::inc_counter(&metrics::ACTION_STAKE_TOTAL);
@@ -388,6 +403,7 @@ impl Runtime {
         outgoing_receipts: &mut Vec<Receipt>,
         validator_proposals: &mut Vec<ValidatorStake>,
         stats: &mut ApplyStats,
+        epoch_info_provider: &dyn EpochInfoProvider,
     ) -> Result<ExecutionOutcomeWithId, RuntimeError> {
         let action_receipt = match receipt.receipt {
             ReceiptEnum::Action(ref action_receipt) => action_receipt,
@@ -445,6 +461,7 @@ impl Runtime {
                     u64::max_value() - action_index as u64,
                 ),
                 is_last_action,
+                epoch_info_provider,
             )?;
             if new_result.result.is_ok() {
                 if let Err(e) = new_result.new_receipts.iter().try_for_each(|receipt| {
@@ -632,25 +649,26 @@ impl Runtime {
             total_exec_fees(&self.config.transaction_costs, &action_receipt.actions)?,
             self.config.transaction_costs.action_receipt_creation_config.exec_fee(),
         )?;
-        let mut deposit_refund = if result.result.is_err() { total_deposit } else { 0 };
+        let deposit_refund = if result.result.is_err() { total_deposit } else { 0 };
         let gas_refund = if result.result.is_err() {
             safe_add_gas(prepaid_gas, exec_gas)? - result.gas_burnt
         } else {
             safe_add_gas(prepaid_gas, exec_gas)? - result.gas_used
         };
-        let mut gas_balance_refund = safe_gas_to_balance(action_receipt.gas_price, gas_refund)?;
-        if action_receipt.signer_id == receipt.predecessor_id {
-            // Merging 2 refunds
-            deposit_refund = safe_add_balance(deposit_refund, gas_balance_refund)?;
-            gas_balance_refund = 0;
-        }
+        let gas_balance_refund = safe_gas_to_balance(action_receipt.gas_price, gas_refund)?;
         if deposit_refund > 0 {
-            result.new_receipts.push(Receipt::new_refund(&receipt.predecessor_id, deposit_refund));
-        }
-        if gas_balance_refund > 0 {
             result
                 .new_receipts
-                .push(Receipt::new_refund(&action_receipt.signer_id, gas_balance_refund));
+                .push(Receipt::new_balance_refund(&receipt.predecessor_id, deposit_refund));
+        }
+        if gas_balance_refund > 0 {
+            // Gas refunds refund the allowance of the access key, so if the key exists on the
+            // account it will increase the allowance by the refund amount.
+            result.new_receipts.push(Receipt::new_gas_refund(
+                &action_receipt.signer_id,
+                gas_balance_refund,
+                action_receipt.signer_public_key.clone(),
+            ));
         }
         Ok(())
     }
@@ -663,6 +681,7 @@ impl Runtime {
         outgoing_receipts: &mut Vec<Receipt>,
         validator_proposals: &mut Vec<ValidatorStake>,
         stats: &mut ApplyStats,
+        epoch_info_provider: &dyn EpochInfoProvider,
     ) -> Result<Option<ExecutionOutcomeWithId>, RuntimeError> {
         let account_id = &receipt.receiver_id;
         match receipt.receipt {
@@ -730,6 +749,7 @@ impl Runtime {
                                 outgoing_receipts,
                                 validator_proposals,
                                 stats,
+                                epoch_info_provider,
                             )
                             .map(Some);
                     } else {
@@ -783,6 +803,7 @@ impl Runtime {
                             outgoing_receipts,
                             validator_proposals,
                             stats,
+                            epoch_info_provider,
                         )
                         .map(Some);
                 } else {
@@ -939,6 +960,7 @@ impl Runtime {
         apply_state: &ApplyState,
         incoming_receipts: &[Receipt],
         transactions: &[SignedTransaction],
+        epoch_info_provider: &dyn EpochInfoProvider,
     ) -> Result<ApplyResult, RuntimeError> {
         let initial_state = TrieUpdate::new(trie.clone(), root);
         let mut state_update = TrieUpdate::new(trie, root);
@@ -992,6 +1014,7 @@ impl Runtime {
                 &mut outgoing_receipts,
                 &mut validator_proposals,
                 &mut stats,
+                epoch_info_provider,
             )?
             .into_iter()
             .try_for_each(
@@ -1270,7 +1293,7 @@ mod tests {
     use near_crypto::{InMemorySigner, KeyType, Signer};
     use near_primitives::errors::ReceiptValidationError;
     use near_primitives::hash::hash;
-    use near_primitives::test_utils::account_new;
+    use near_primitives::test_utils::{account_new, MockEpochInfoProvider};
     use near_primitives::transaction::TransferAction;
     use near_primitives::types::MerkleHash;
     use near_store::test_utils::create_tries;
@@ -1318,7 +1341,8 @@ mod tests {
         initial_balance: Balance,
         initial_locked: Balance,
         gas_limit: Gas,
-    ) -> (Runtime, ShardTries, CryptoHash, ApplyState, Arc<InMemorySigner>) {
+    ) -> (Runtime, ShardTries, CryptoHash, ApplyState, Arc<InMemorySigner>, impl EpochInfoProvider)
+    {
         let tries = create_tries();
         let root = MerkleHash::default();
         let runtime = Runtime::new(RuntimeConfig::default());
@@ -1344,21 +1368,32 @@ mod tests {
 
         let apply_state = ApplyState {
             block_index: 0,
-            epoch_length: 3,
+            last_block_hash: Default::default(),
+            epoch_id: Default::default(),
             epoch_height: 0,
             gas_price: GAS_PRICE,
             block_timestamp: 100,
             gas_limit: Some(gas_limit),
         };
 
-        (runtime, tries, root, apply_state, signer)
+        (runtime, tries, root, apply_state, signer, MockEpochInfoProvider::default())
     }
 
     #[test]
     fn test_apply_no_op() {
-        let (runtime, tries, root, apply_state, _) =
+        let (runtime, tries, root, apply_state, _, epoch_info_provider) =
             setup_runtime(to_yocto(1_000_000), 0, 10u64.pow(15));
-        runtime.apply(tries.get_trie_for_shard(0), root, &None, &apply_state, &[], &[]).unwrap();
+        runtime
+            .apply(
+                tries.get_trie_for_shard(0),
+                root,
+                &None,
+                &apply_state,
+                &[],
+                &[],
+                &epoch_info_provider,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1366,7 +1401,7 @@ mod tests {
         let initial_locked = to_yocto(500_000);
         let reward = to_yocto(10_000_000);
         let small_refund = to_yocto(500);
-        let (runtime, tries, root, apply_state, _) =
+        let (runtime, tries, root, apply_state, _, epoch_info_provider) =
             setup_runtime(to_yocto(1_000_000), initial_locked, 10u64.pow(15));
 
         let validator_accounts_update = ValidatorAccountsUpdate {
@@ -1383,8 +1418,9 @@ mod tests {
                 root,
                 &Some(validator_accounts_update),
                 &apply_state,
-                &[Receipt::new_refund(&alice_account(), small_refund)],
+                &[Receipt::new_balance_refund(&alice_account(), small_refund)],
                 &[],
+                &epoch_info_provider,
             )
             .unwrap();
     }
@@ -1395,7 +1431,7 @@ mod tests {
         let initial_locked = to_yocto(500_000);
         let small_transfer = to_yocto(10_000);
         let gas_limit = 1;
-        let (runtime, tries, mut root, apply_state, _) =
+        let (runtime, tries, mut root, apply_state, _, epoch_info_provider) =
             setup_runtime(initial_balance, initial_locked, gas_limit);
 
         let n = 10;
@@ -1405,7 +1441,15 @@ mod tests {
         for i in 1..=n + 3 {
             let prev_receipts: &[Receipt] = if i == 1 { &receipts } else { &[] };
             let apply_result = runtime
-                .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, prev_receipts, &[])
+                .apply(
+                    tries.get_trie_for_shard(0),
+                    root,
+                    &None,
+                    &apply_state,
+                    prev_receipts,
+                    &[],
+                    &epoch_info_provider,
+                )
                 .unwrap();
             let (store_update, new_root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
             root = new_root;
@@ -1427,7 +1471,7 @@ mod tests {
         let initial_balance = to_yocto(1_000_000);
         let initial_locked = to_yocto(500_000);
         let small_transfer = to_yocto(10_000);
-        let (runtime, tries, mut root, mut apply_state, _) =
+        let (runtime, tries, mut root, mut apply_state, _, epoch_info_provider) =
             setup_runtime(initial_balance, initial_locked, 1);
 
         let receipt_gas_cost =
@@ -1443,7 +1487,15 @@ mod tests {
         for i in 1..=n / 3 + 3 {
             let prev_receipts: &[Receipt] = receipt_chunks.next().unwrap_or_default();
             let apply_result = runtime
-                .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, prev_receipts, &[])
+                .apply(
+                    tries.get_trie_for_shard(0),
+                    root,
+                    &None,
+                    &apply_state,
+                    prev_receipts,
+                    &[],
+                    &epoch_info_provider,
+                )
                 .unwrap();
             let (store_update, new_root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
             root = new_root;
@@ -1465,7 +1517,7 @@ mod tests {
         let initial_balance = to_yocto(1_000_000);
         let initial_locked = to_yocto(500_000);
         let small_transfer = to_yocto(10_000);
-        let (runtime, tries, mut root, mut apply_state, _) =
+        let (runtime, tries, mut root, mut apply_state, _, epoch_info_provider) =
             setup_runtime(initial_balance, initial_locked, 1);
 
         let receipt_gas_cost =
@@ -1490,7 +1542,15 @@ mod tests {
             let prev_receipts: &[Receipt] = receipt_chunks.next().unwrap_or_default();
             num_receipts_given += prev_receipts.len() as u64;
             let apply_result = runtime
-                .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, prev_receipts, &[])
+                .apply(
+                    tries.get_trie_for_shard(0),
+                    root,
+                    &None,
+                    &apply_state,
+                    prev_receipts,
+                    &[],
+                    &epoch_info_provider,
+                )
                 .unwrap();
             let (store_update, new_root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
             root = new_root;
@@ -1536,7 +1596,7 @@ mod tests {
         let initial_balance = to_yocto(1_000_000);
         let initial_locked = to_yocto(500_000);
         let small_transfer = to_yocto(10_000);
-        let (mut runtime, tries, root, mut apply_state, signer) =
+        let (mut runtime, tries, root, mut apply_state, signer, epoch_info_provider) =
             setup_runtime(initial_balance, initial_locked, 1);
 
         let receipt_exec_gas_fee = 1000;
@@ -1575,6 +1635,7 @@ mod tests {
                 &apply_state,
                 &receipts[0..2],
                 &local_transactions[0..4],
+                &epoch_info_provider,
             )
             .unwrap();
         let (store_update, root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
@@ -1606,6 +1667,7 @@ mod tests {
                 &apply_state,
                 &receipts[2..3],
                 &local_transactions[4..5],
+                &epoch_info_provider,
             )
             .unwrap();
         let (store_update, root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
@@ -1634,6 +1696,7 @@ mod tests {
                 &apply_state,
                 &receipts[3..4],
                 &local_transactions[5..9],
+                &epoch_info_provider,
             )
             .unwrap();
         let (store_update, root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
@@ -1658,7 +1721,15 @@ mod tests {
         // R#4 is added to delayed queue.
         // The new delayed queue is R#3, R#4
         let apply_result = runtime
-            .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, &receipts[4..5], &[])
+            .apply(
+                tries.get_trie_for_shard(0),
+                root,
+                &None,
+                &apply_state,
+                &receipts[4..5],
+                &[],
+                &epoch_info_provider,
+            )
             .unwrap();
         let (store_update, root) = tries.apply_all(&apply_result.trie_changes, 0).unwrap();
         store_update.commit().unwrap();
@@ -1677,7 +1748,15 @@ mod tests {
         // We process R#3, R#4, R#5.
         // The new delayed queue is empty.
         let apply_result = runtime
-            .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, &receipts[5..6], &[])
+            .apply(
+                tries.get_trie_for_shard(0),
+                root,
+                &None,
+                &apply_state,
+                &receipts[5..6],
+                &[],
+                &epoch_info_provider,
+            )
             .unwrap();
 
         assert_eq!(
@@ -1697,7 +1776,7 @@ mod tests {
         let initial_locked = to_yocto(500_000);
         let small_transfer = to_yocto(10_000);
         let gas_limit = 1;
-        let (runtime, tries, root, apply_state, _) =
+        let (runtime, tries, root, apply_state, _, epoch_info_provider) =
             setup_runtime(initial_balance, initial_locked, gas_limit);
 
         let n = 1;
@@ -1706,7 +1785,15 @@ mod tests {
         receipts.get_mut(0).unwrap().predecessor_id = invalid_account_id.clone();
 
         let err = runtime
-            .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, &receipts, &[])
+            .apply(
+                tries.get_trie_for_shard(0),
+                root,
+                &None,
+                &apply_state,
+                &receipts,
+                &[],
+                &epoch_info_provider,
+            )
             .err()
             .unwrap();
         assert_eq!(
@@ -1723,7 +1810,7 @@ mod tests {
         let initial_locked = to_yocto(500_000);
         let small_transfer = to_yocto(10_000);
         let gas_limit = 1;
-        let (runtime, tries, root, apply_state, _) =
+        let (runtime, tries, root, apply_state, _, epoch_info_provider) =
             setup_runtime(initial_balance, initial_locked, gas_limit);
 
         let n = 1;
@@ -1743,7 +1830,15 @@ mod tests {
         store_update.commit().unwrap();
 
         let err = runtime
-            .apply(tries.get_trie_for_shard(0), root, &None, &apply_state, &[], &[])
+            .apply(
+                tries.get_trie_for_shard(0),
+                root,
+                &None,
+                &apply_state,
+                &[],
+                &[],
+                &epoch_info_provider,
+            )
             .err()
             .unwrap();
         assert_eq!(

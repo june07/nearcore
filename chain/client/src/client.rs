@@ -2,6 +2,7 @@
 //! This client works completely synchronously and must be operated by some async actor outside.
 
 use std::collections::{HashMap, HashSet};
+use std::iter;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -14,12 +15,12 @@ use near_chain::test_utils::format_hash;
 use near_chain::types::{AcceptedBlock, LatestKnown, ReceiptResponse};
 use near_chain::{
     BlockStatus, Chain, ChainGenesis, ChainStoreAccess, Doomslug, DoomslugThresholdMode, ErrorKind,
-    Provenance, RuntimeAdapter, Tip,
+    Provenance, RuntimeAdapter,
 };
 use near_chain_configs::ClientConfig;
 use near_chunks::{ProcessPartialEncodedChunkResult, ShardsManager};
 use near_network::{FullPeerInfo, NetworkAdapter, NetworkClientResponses, NetworkRequests};
-use near_primitives::block::{Approval, ApprovalInner, ApprovalMessage, Block, BlockHeader};
+use near_primitives::block::{Approval, ApprovalInner, ApprovalMessage, Block, BlockHeader, Tip};
 use near_primitives::challenge::{Challenge, ChallengeBody};
 use near_primitives::hash::CryptoHash;
 use near_primitives::merkle::{merklize, MerklePath};
@@ -632,9 +633,15 @@ impl Client {
             }
         }
 
-        for missing_chunks in blocks_missing_chunks.write().unwrap().drain(..) {
-            self.shards_mgr.request_chunks(missing_chunks).unwrap();
-        }
+        // Request any missing chunks
+        self.shards_mgr.request_chunks(
+            blocks_missing_chunks
+                .write()
+                .unwrap()
+                .drain(..)
+                .flat_map(|missing_chunks| missing_chunks.into_iter()),
+        );
+
         let unwrapped_accepted_blocks = accepted_blocks.write().unwrap().drain(..).collect();
         (unwrapped_accepted_blocks, result)
     }
@@ -671,7 +678,7 @@ impl Client {
                 Ok(self.process_blocks_with_missing_chunks(prev_block_hash))
             }
             ProcessPartialEncodedChunkResult::NeedMorePartsOrReceipts(chunk_header) => {
-                self.shards_mgr.request_chunks(vec![*chunk_header]).unwrap();
+                self.shards_mgr.request_chunks(iter::once(*chunk_header));
                 Ok(vec![])
             }
             ProcessPartialEncodedChunkResult::NeedBlock => {
@@ -727,7 +734,7 @@ impl Client {
         let next_block_producer =
             self.runtime_adapter.get_block_producer(&next_epoch_id, approval.target_height)?;
         if Some(&next_block_producer) == self.validator_signer.as_ref().map(|x| x.validator_id()) {
-            self.collect_block_approval(&approval, false);
+            self.collect_block_approval(&approval, true);
         } else {
             let approval_message = ApprovalMessage::new(approval, next_block_producer);
             self.network_adapter.do_send(NetworkRequests::Approval { approval_message });
@@ -930,9 +937,15 @@ impl Client {
             accepted_blocks.write().unwrap().push(accepted_block);
         }, |missing_chunks| blocks_missing_chunks.write().unwrap().push(missing_chunks), |challenge| challenges.write().unwrap().push(challenge));
         self.send_challenges(challenges);
-        for missing_chunks in blocks_missing_chunks.write().unwrap().drain(..) {
-            self.shards_mgr.request_chunks(missing_chunks).unwrap();
-        }
+
+        self.shards_mgr.request_chunks(
+            blocks_missing_chunks
+                .write()
+                .unwrap()
+                .drain(..)
+                .flat_map(|missing_chunks| missing_chunks.into_iter()),
+        );
+
         let unwrapped_accepted_blocks = accepted_blocks.write().unwrap().drain(..).collect();
         unwrapped_accepted_blocks
     }
@@ -1166,12 +1179,20 @@ impl Client {
             debug!(target: "client", "Invalid tx: expired or from a different fork -- {:?}", tx);
             return Ok(NetworkClientResponses::InvalidTx(e));
         }
+        let gas_price = cur_block_header.inner_rest.gas_price;
         let epoch_id = self.runtime_adapter.get_epoch_id_from_prev_block(&head.last_block_hash)?;
+
+        // Fast transaction validation without a state root.
+        if let Some(err) =
+            self.runtime_adapter.validate_tx(gas_price, None, &tx).expect("no storage errors")
+        {
+            debug!(target: "client", "Invalid tx during basic validation: {:?}", err);
+            return Ok(NetworkClientResponses::InvalidTx(err));
+        }
 
         if self.runtime_adapter.cares_about_shard(me, &head.last_block_hash, shard_id, true)
             || self.runtime_adapter.will_care_about_shard(me, &head.last_block_hash, shard_id, true)
         {
-            let gas_price = cur_block_header.inner_rest.gas_price;
             let state_root = match self.chain.get_chunk_extra(&head.last_block_hash, shard_id) {
                 Ok(chunk_extra) => chunk_extra.state_root,
                 Err(_) => {
@@ -1189,7 +1210,7 @@ impl Client {
             };
             if let Some(err) = self
                 .runtime_adapter
-                .validate_tx(gas_price, state_root, &tx)
+                .validate_tx(gas_price, Some(state_root), &tx)
                 .expect("no storage errors")
             {
                 debug!(target: "client", "Invalid tx: {:?}", err);
@@ -1235,6 +1256,7 @@ impl Client {
                 return Ok(NetworkClientResponses::NoResponse);
             }
             // We are not tracking this shard, so there is no way to validate this tx. Just rerouting.
+
             self.forward_tx(&epoch_id, tx)?;
             Ok(NetworkClientResponses::RequestRouted)
         }
@@ -1313,9 +1335,14 @@ impl Client {
 
                     self.send_challenges(challenges);
 
-                    for missing_chunks in blocks_missing_chunks.write().unwrap().drain(..) {
-                        self.shards_mgr.request_chunks(missing_chunks).unwrap();
-                    }
+                    self.shards_mgr.request_chunks(
+                        blocks_missing_chunks
+                            .write()
+                            .unwrap()
+                            .drain(..)
+                            .flat_map(|missing_chunks| missing_chunks.into_iter()),
+                    );
+
                     let unwrapped_accepted_blocks =
                         accepted_blocks.write().unwrap().drain(..).collect();
                     return Ok(unwrapped_accepted_blocks);

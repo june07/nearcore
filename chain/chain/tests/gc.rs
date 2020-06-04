@@ -3,6 +3,7 @@ mod tests {
     use std::sync::Arc;
 
     use near_chain::chain::{check_refcount_map, Chain, ChainGenesis};
+    use near_chain::store_validator::StoreValidator;
     use near_chain::test_utils::KeyValueRuntime;
     use near_chain::types::Tip;
     use near_chain::DoomslugThresholdMode;
@@ -10,19 +11,19 @@ mod tests {
     use near_crypto::KeyType;
     use near_primitives::block::Block;
     use near_primitives::merkle::PartialMerkleTree;
-    use near_primitives::types::{NumBlocks, StateRoot};
+    use near_primitives::types::{NumBlocks, NumShards, StateRoot};
     use near_primitives::validator_signer::InMemoryValidatorSigner;
     use near_store::test_utils::{create_test_store, gen_changes};
-    use near_store::{ShardTries, StoreUpdate, StoreValidator, Trie, WrappedTrieChanges};
+    use near_store::{ShardTries, StoreUpdate, Trie, WrappedTrieChanges};
     use rand::Rng;
 
-    fn get_chain(num_shards: u64) -> Chain {
+    fn get_chain(num_shards: NumShards) -> Chain {
         get_chain_with_epoch_length_and_num_shards(10, num_shards)
     }
 
     fn get_chain_with_epoch_length_and_num_shards(
         epoch_length: NumBlocks,
-        num_shards: u64,
+        num_shards: NumShards,
     ) -> Chain {
         let store = create_test_store();
         let chain_genesis = ChainGenesis::test();
@@ -87,7 +88,6 @@ mod tests {
                 }
 
                 let new_root = trie_changes.new_root;
-
                 let wrapped_trie_changes = WrappedTrieChanges::new(
                     tries.clone(),
                     shard_id,
@@ -254,10 +254,21 @@ mod tests {
         }
         let mut genesis = GenesisConfig::default();
         genesis.genesis_height = 0;
-        let mut store_validator = StoreValidator::default();
-        store_validator.validate(&*chain1.store().owned_store(), &genesis);
+        let mut store_validator = StoreValidator::new(
+            None,
+            genesis.clone(),
+            chain1.runtime_adapter.clone(),
+            chain1.store().owned_store(),
+        );
+        store_validator.validate();
         assert!(!store_validator.is_failed());
-        store_validator.validate(&*chain2.store().owned_store(), &genesis);
+        let mut store_validator = StoreValidator::new(
+            None,
+            genesis,
+            chain2.runtime_adapter.clone(),
+            chain2.store().owned_store(),
+        );
+        store_validator.validate();
         assert!(!store_validator.is_failed());
     }
 

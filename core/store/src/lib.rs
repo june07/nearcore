@@ -10,7 +10,8 @@ use cached::{Cached, SizedCache};
 
 pub use db::DBCol::{self, *};
 pub use db::{
-    HEADER_HEAD_KEY, HEAD_KEY, LARGEST_TARGET_HEIGHT_KEY, LATEST_KNOWN_KEY, SYNC_HEAD_KEY, TAIL_KEY,
+    CHUNK_TAIL_KEY, HEADER_HEAD_KEY, HEAD_KEY, LARGEST_TARGET_HEIGHT_KEY, LATEST_KNOWN_KEY,
+    SYNC_HEAD_KEY, TAIL_KEY,
 };
 use near_crypto::PublicKey;
 use near_primitives::account::{AccessKey, Account};
@@ -21,7 +22,6 @@ use near_primitives::receipt::{Receipt, ReceivedData};
 use near_primitives::serialize::to_base;
 use near_primitives::trie_key::{trie_key_parsers, TrieKey};
 use near_primitives::types::AccountId;
-pub use validate::StoreValidator;
 
 use crate::db::{DBOp, DBTransaction, Database, RocksDB};
 pub use crate::trie::{
@@ -33,7 +33,6 @@ pub use crate::trie::{
 mod db;
 pub mod test_utils;
 mod trie;
-mod validate;
 
 pub struct Store {
     storage: Arc<dyn Database>,

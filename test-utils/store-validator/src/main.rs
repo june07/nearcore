@@ -1,11 +1,14 @@
 use std::path::Path;
 use std::process;
+use std::sync::Arc;
 
-use ansi_term::Color::{Green, Red};
+use ansi_term::Color::{Green, Red, White, Yellow};
 use clap::{App, Arg, SubCommand};
 
+use near_chain::store_validator::StoreValidator;
+use near_chain::RuntimeAdapter;
 use near_logger_utils::init_integration_logger;
-use near_store::{create_store, StoreValidator};
+use near_store::create_store;
 use neard::{get_default_home, get_store_path, load_config};
 
 fn main() {
@@ -28,8 +31,21 @@ fn main() {
 
     let store = create_store(&get_store_path(&home_dir));
 
-    let mut store_validator = StoreValidator::default();
-    store_validator.validate(&*store, &near_config.genesis.config);
+    let runtime_adapter: Arc<dyn RuntimeAdapter> = Arc::new(neard::NightshadeRuntime::new(
+        &home_dir,
+        store.clone(),
+        Arc::clone(&near_config.genesis),
+        near_config.client_config.tracked_accounts.clone(),
+        near_config.client_config.tracked_shards.clone(),
+    ));
+
+    let mut store_validator = StoreValidator::new(
+        near_config.validator_signer.as_ref().map(|x| x.validator_id().clone()),
+        near_config.genesis.config.clone(),
+        runtime_adapter.clone(),
+        store.clone(),
+    );
+    store_validator.validate();
 
     if store_validator.tests_done() == 0 {
         println!("{}", Red.bold().paint("No conditions has been validated"));
@@ -40,7 +56,13 @@ fn main() {
         Green.bold().paint(store_validator.tests_done().to_string())
     );
     for error in store_validator.errors.iter() {
-        println!("{}: {}", Red.bold().paint(&error.col.to_string()), error.msg);
+        println!(
+            "{} > {} > {} > {}",
+            Red.bold().paint(&error.func.to_string()),
+            Yellow.bold().paint(&error.col.unwrap().to_string()),
+            White.bold().paint(error.key.as_ref().unwrap()),
+            error.reason
+        );
     }
     if store_validator.is_failed() {
         println!("Errors found: {}", Red.bold().paint(store_validator.num_failed().to_string()));
