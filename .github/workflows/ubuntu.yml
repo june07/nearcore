@@ -2,9 +2,7 @@ name: Build Binaries
 
 on:
   push:
-    branches: [ beta ]
-  pull_request:
-    branches: [ beta ]
+    branches: [ june07-nearprotocol-beta ]
 
 env:
   CARGO_TERM_COLOR: always
