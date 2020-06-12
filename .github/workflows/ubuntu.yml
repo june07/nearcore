@@ -1,8 +1,6 @@
 name: Build Binaries
 
 on:
-  push:
-    branches: [ june07-nearprotocol-beta ]
   pull_request:
     branches: [ june07-nearprotocol-beta ]
 
