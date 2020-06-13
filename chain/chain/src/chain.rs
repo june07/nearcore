@@ -1,4 +1,3 @@
-use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration as TimeDuration, Instant};
@@ -78,6 +77,7 @@ pub const NUM_EPOCHS_TO_KEEP_STORE_DATA: u64 = 5;
 pub struct BlockEconomicsConfig {
     pub gas_price_adjustment_rate: Rational,
     pub min_gas_price: Balance,
+    pub max_gas_price: Balance,
 }
 
 enum ApplyChunksMode {
@@ -181,6 +181,7 @@ pub struct ChainGenesis {
     pub height: BlockHeight,
     pub gas_limit: Gas,
     pub min_gas_price: Balance,
+    pub max_gas_price: Balance,
     pub total_supply: Balance,
     pub max_inflation_rate: Rational,
     pub gas_price_adjustment_rate: Rational,
@@ -195,6 +196,7 @@ impl ChainGenesis {
         height: BlockHeight,
         gas_limit: Gas,
         min_gas_price: Balance,
+        max_gas_price: Balance,
         total_supply: Balance,
         max_inflation_rate: Rational,
         gas_price_adjustment_rate: Rational,
@@ -207,6 +209,7 @@ impl ChainGenesis {
             height,
             gas_limit,
             min_gas_price,
+            max_gas_price,
             total_supply,
             max_inflation_rate,
             gas_price_adjustment_rate,
@@ -228,6 +231,7 @@ where
             genesis_config.genesis_height,
             genesis_config.gas_limit,
             genesis_config.min_gas_price,
+            genesis_config.max_gas_price,
             genesis_config.total_supply,
             genesis_config.max_inflation_rate,
             genesis_config.gas_price_adjustment_rate,
@@ -369,6 +373,7 @@ impl Chain {
             block_economics_config: BlockEconomicsConfig {
                 gas_price_adjustment_rate: chain_genesis.gas_price_adjustment_rate,
                 min_gas_price: chain_genesis.min_gas_price,
+                max_gas_price: chain_genesis.max_gas_price,
             },
             doomslug_threshold_mode,
         })
@@ -540,27 +545,32 @@ impl Chain {
     pub fn clear_data(
         &mut self,
         tries: ShardTries,
-        gc_step_size: BlockHeightDelta,
+        gc_blocks_limit: NumBlocks,
     ) -> Result<(), Error> {
         let head = self.store.head()?;
         let tail = self.store.tail()?;
-        let mut gc_stop_height = self.runtime_adapter.get_gc_stop_height(&head.last_block_hash)?;
+        let gc_stop_height = self.runtime_adapter.get_gc_stop_height(&head.last_block_hash)?;
         if gc_stop_height > head.height {
             return Err(ErrorKind::GCError(
                 "gc_stop_height cannot be larger than head.height".into(),
             )
             .into());
         }
-        // To avoid network slowdown, we limit the number of heights to clear per GC execution
-        gc_stop_height = min(gc_stop_height, tail + gc_step_size);
+        let mut gc_blocks_remaining = gc_blocks_limit;
 
         // Forks Cleaning
         for height in tail..gc_stop_height {
-            self.clear_forks_data(tries.clone(), height)?;
+            if gc_blocks_remaining == 0 {
+                return Ok(());
+            }
+            self.clear_forks_data(tries.clone(), height, &mut gc_blocks_remaining)?;
         }
 
         // Canonical Chain Clearing
         for height in tail + 1..gc_stop_height {
+            if gc_blocks_remaining == 0 {
+                return Ok(());
+            }
             let mut chain_store_update = self.store.store_update();
             if let Ok(blocks_current_height) =
                 chain_store_update.get_all_block_hashes_by_height(height)
@@ -577,6 +587,7 @@ impl Chain {
                         debug_assert_eq!(blocks_current_height.len(), 1);
                         chain_store_update
                             .clear_block_data(*block_hash, GCMode::Canonical(tries.clone()))?;
+                        gc_blocks_remaining -= 1;
                     } else {
                         return Err(ErrorKind::GCError(
                             "block on canonical chain shouldn't have refcount 0".into(),
@@ -595,6 +606,7 @@ impl Chain {
         &mut self,
         tries: ShardTries,
         height: BlockHeight,
+        gc_blocks_remaining: &mut NumBlocks,
     ) -> Result<(), Error> {
         if let Ok(blocks_current_height) = self.store.get_all_block_hashes_by_height(height) {
             let blocks_current_height =
@@ -602,6 +614,9 @@ impl Chain {
             for block_hash in blocks_current_height.iter() {
                 let mut current_hash = *block_hash;
                 loop {
+                    if *gc_blocks_remaining == 0 {
+                        return Ok(());
+                    }
                     // Block `block_hash` is not on the Canonical Chain
                     // because shorter chain cannot be Canonical one
                     // and it may be safely deleted
@@ -615,6 +630,7 @@ impl Chain {
                         chain_store_update
                             .clear_block_data(current_hash, GCMode::Fork(tries.clone()))?;
                         chain_store_update.commit()?;
+                        *gc_blocks_remaining -= 1;
 
                         current_hash = prev_hash;
                     } else {
@@ -2876,6 +2892,7 @@ impl<'a> ChainUpdate<'a> {
         if !block.verify_gas_price(
             prev_gas_price,
             self.block_economics_config.min_gas_price,
+            self.block_economics_config.max_gas_price,
             self.block_economics_config.gas_price_adjustment_rate,
         ) {
             byzantine_assert!(false);

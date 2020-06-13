@@ -1916,6 +1916,12 @@ impl<'a> ChainStoreUpdate<'a> {
                         .map(|trie_changes: TrieChanges| {
                             tries
                                 .revert_insertions(&trie_changes, shard_id, &mut store_update)
+                                .map(|_| {
+                                    store_update.delete(
+                                        ColTrieChanges,
+                                        &get_block_shard_id(&block_hash, shard_id),
+                                    );
+                                })
                                 .map_err(|err| ErrorKind::Other(err.to_string()))
                         })
                         .unwrap_or(Ok(()))?;
@@ -1929,6 +1935,12 @@ impl<'a> ChainStoreUpdate<'a> {
                         .map(|trie_changes: TrieChanges| {
                             tries
                                 .apply_deletions(&trie_changes, shard_id, &mut store_update)
+                                .map(|_| {
+                                    store_update.delete(
+                                        ColTrieChanges,
+                                        &get_block_shard_id(&block_hash, shard_id),
+                                    );
+                                })
                                 .map_err(|err| ErrorKind::Other(err.to_string()))
                         })
                         .unwrap_or(Ok(()))?;
@@ -1937,7 +1949,10 @@ impl<'a> ChainStoreUpdate<'a> {
                 block_hash = *self.get_block_header(&block_hash)?.prev_hash();
             }
             GCMode::StateSync => {
-                // Do nothing here
+                // Not apply the data from ColTrieChanges
+                for shard_id in 0..header.chunk_mask().len() as ShardId {
+                    store_update.delete(ColTrieChanges, &get_block_shard_id(&block_hash, shard_id));
+                }
             }
         }
 
@@ -2480,8 +2495,6 @@ mod tests {
     use crate::test_utils::KeyValueRuntime;
     use crate::{Chain, ChainGenesis, DoomslugThresholdMode};
 
-    const MAX_HEIGHTS_TO_CLEAR: u64 = 100;
-
     fn get_chain() -> Chain {
         get_chain_with_epoch_length(10)
     }
@@ -2727,7 +2740,7 @@ mod tests {
         assert!(check_refcount_map(&mut chain).is_ok());
         chain.epoch_length = 1;
         let trie = chain.runtime_adapter.get_tries();
-        assert!(chain.clear_data(trie, MAX_HEIGHTS_TO_CLEAR).is_ok());
+        assert!(chain.clear_data(trie, 100).is_ok());
 
         assert!(chain.get_block(&blocks[0].hash()).is_ok());
 
@@ -2812,10 +2825,20 @@ mod tests {
         assert!(chain.mut_store().get_next_block_hash(blocks[6].hash()).is_ok());
     }
 
-    /// Test that MAX_HEIGHTS_TO_CLEAR works properly
+    /// Test that `gc_blocks_limit` works properly
     #[cfg(feature = "expensive_tests")]
     #[test]
     fn test_clear_old_data_too_many_heights() {
+        for i in 1..5 {
+            println!("gc_blocks_limit == {:?}", i);
+            test_clear_old_data_too_many_heights_common(i);
+        }
+        test_clear_old_data_too_many_heights_common(25);
+        test_clear_old_data_too_many_heights_common(50);
+        test_clear_old_data_too_many_heights_common(87);
+    }
+
+    fn test_clear_old_data_too_many_heights_common(gc_blocks_limit: NumBlocks) {
         let mut chain = get_chain_with_epoch_length(1);
         let genesis = chain.get_block_by_height(0).unwrap().clone();
         let signer =
@@ -2846,13 +2869,13 @@ mod tests {
 
         for iter in 0..10 {
             println!("ITERATION #{:?}", iter);
-            assert!(chain.clear_data(trie.clone(), MAX_HEIGHTS_TO_CLEAR).is_ok());
+            assert!(chain.clear_data(trie.clone(), gc_blocks_limit).is_ok());
 
             assert!(chain.get_block(&blocks[0].hash()).is_ok());
 
             // epoch didn't change so no data is garbage collected.
             for i in 1..1000 {
-                if i < (iter + 1) * (MAX_HEIGHTS_TO_CLEAR - 1) as usize {
+                if i < (iter + 1) * gc_blocks_limit as usize {
                     assert!(chain.get_block(&blocks[i].hash()).is_err());
                     assert!(chain
                         .mut_store()

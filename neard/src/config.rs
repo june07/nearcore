@@ -127,8 +127,8 @@ pub const GENESIS_CONFIG_FILENAME: &str = "genesis.json";
 pub const NODE_KEY_FILE: &str = "node_key.json";
 pub const VALIDATOR_KEY_FILE: &str = "validator_key.json";
 
-pub const MAINNET_TELEMETRY_URL: &str = "https://explorer.nearprotocol.com/api/nodes";
-pub const NETWORK_TELEMETRY_URL: &str = "https://explorer.{}.nearprotocol.com/api/nodes";
+pub const MAINNET_TELEMETRY_URL: &str = "https://explorer.mainnet.near.org/api/nodes";
+pub const NETWORK_TELEMETRY_URL: &str = "https://explorer.{}.near.org/api/nodes";
 
 lazy_static! {
     /// The rate at which the gas price can be adjusted (alpha in the formula).
@@ -264,7 +264,7 @@ fn default_sync_step_period() -> Duration {
     Duration::from_millis(10)
 }
 
-fn default_gc_step_size() -> BlockHeightDelta {
+fn default_gc_blocks_limit() -> NumBlocks {
     2
 }
 
@@ -355,8 +355,8 @@ pub struct Config {
     pub tracked_accounts: Vec<AccountId>,
     pub tracked_shards: Vec<ShardId>,
     pub archive: bool,
-    #[serde(default = "default_gc_step_size")]
-    pub gc_step_size: BlockHeightDelta,
+    #[serde(default = "default_gc_blocks_limit")]
+    pub gc_blocks_limit: NumBlocks,
 }
 
 impl Default for Config {
@@ -373,7 +373,7 @@ impl Default for Config {
             tracked_accounts: vec![],
             tracked_shards: vec![],
             archive: false,
-            gc_step_size: default_gc_step_size(),
+            gc_blocks_limit: default_gc_blocks_limit(),
         }
     }
 }
@@ -537,7 +537,7 @@ impl NearConfig {
                 tracked_accounts: config.tracked_accounts,
                 tracked_shards: config.tracked_shards,
                 archive: config.archive,
-                gc_step_size: config.gc_step_size,
+                gc_blocks_limit: config.gc_blocks_limit,
             },
             network_config: NetworkConfig {
                 public_key: network_key_pair.public_key,
@@ -786,6 +786,7 @@ pub fn init_configs(
                 protocol_treasury_account: account_id,
                 fishermen_threshold: FISHERMEN_THRESHOLD,
                 min_gas_price: MIN_GAS_PRICE,
+                ..Default::default()
             };
             let genesis = Genesis::new(genesis_config, records.into());
             genesis.to_file(&dir.join(config.genesis_file));
