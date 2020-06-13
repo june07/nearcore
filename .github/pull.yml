@@ -2,4 +2,5 @@ version: "1"
 rules:
   - base: june07-nearprotocol-beta
     upstream: nearprotocol:master    # change `wei` to the owner of upstream repo
-    mergeMethod: hardreset
+    mergeMethod: merge
+    mergeUnstable: true
