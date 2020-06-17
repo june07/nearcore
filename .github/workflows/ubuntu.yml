@@ -25,7 +25,7 @@ jobs:
       uses: actions/upload-artifact@v2
       with:
         # Artifact name
-        name: target-release
+        name: june07-nearcore-${{ github.sha }}
         #name: binary-artifact-${{ github.sha }}
         # A file, directory or wildcard pattern that describes what to upload
         path: target/release
