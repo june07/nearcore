@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,16 +9,22 @@ use strum::IntoEnumIterator;
 use near_chain_configs::GenesisConfig;
 use near_primitives::block::{Block, BlockHeader};
 use near_primitives::borsh;
+use near_primitives::epoch_manager::{BlockInfo, EpochInfo, AGGREGATOR_KEY};
 use near_primitives::hash::CryptoHash;
-use near_primitives::sharding::{ChunkHash, ShardChunk};
-use near_primitives::types::{AccountId, BlockHeight};
+use near_primitives::sharding::{ChunkHash, ShardChunk, StateSyncInfo};
+use near_primitives::transaction::ExecutionOutcomeWithIdAndProof;
+use near_primitives::types::{AccountId, BlockHeight, EpochId, GCCount, ShardId};
 use near_primitives::utils::get_block_shard_id_rev;
-use near_store::{DBCol, Store, TrieChanges};
+use near_store::{DBCol, Store, TrieChanges, NUM_COLS, SHOULD_COL_GC, SKIP_COL_GC};
 use validate::StoreValidatorError;
 
 use crate::RuntimeAdapter;
 
 mod validate;
+
+fn to_string<T: std::fmt::Debug>(v: &T) -> String {
+    format!("{:?}", v)
+}
 
 #[derive(Debug)]
 pub struct StoreValidatorCache {
@@ -27,9 +33,12 @@ pub struct StoreValidatorCache {
     tail: BlockHeight,
     chunk_tail: BlockHeight,
     block_heights_less_tail: Vec<CryptoHash>,
+    gc_col: Vec<u64>,
+    tx_refcount: HashMap<CryptoHash, u64>,
 
     is_misc_set: bool,
     is_block_height_cmp_tail_prepared: bool,
+    is_tx_refcount_calculated: bool,
 }
 
 impl StoreValidatorCache {
@@ -40,15 +49,18 @@ impl StoreValidatorCache {
             tail: 0,
             chunk_tail: 0,
             block_heights_less_tail: vec![],
+            gc_col: vec![0; NUM_COLS],
+            tx_refcount: HashMap::new(),
             is_misc_set: false,
             is_block_height_cmp_tail_prepared: false,
+            is_tx_refcount_calculated: false,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct ErrorMessage {
-    pub col: DBCol,
+    pub col: String,
     pub key: String,
     pub err: StoreValidatorError,
 }
@@ -91,6 +103,23 @@ impl StoreValidator {
     pub fn is_failed(&self) -> bool {
         self.tests == 0 || self.errors.len() > 0
     }
+    pub fn get_gc_counters(&self) -> Vec<(String, u64)> {
+        let mut res = vec![];
+        for col in DBCol::iter() {
+            if SHOULD_COL_GC[col as usize] && self.inner.gc_col[col as usize] == 0 {
+                if SKIP_COL_GC[col as usize] {
+                    res.push((
+                        to_string(&col) + " (skipping is acceptable)",
+                        self.inner.gc_col[col as usize],
+                    ))
+                } else {
+                    res.push((to_string(&col), self.inner.gc_col[col as usize]))
+                }
+            }
+        }
+        res.sort();
+        res
+    }
     pub fn num_failed(&self) -> u64 {
         self.errors.len() as u64
     }
@@ -98,7 +127,7 @@ impl StoreValidator {
         self.tests
     }
     fn process_error<K: std::fmt::Debug>(&mut self, err: StoreValidatorError, key: K, col: DBCol) {
-        self.errors.push(ErrorMessage { key: format!("{:?}", key), col, err })
+        self.errors.push(ErrorMessage { key: to_string(&key), col: to_string(&col), err })
     }
     fn validate_col(&mut self, col: DBCol) -> Result<(), StoreValidatorError> {
         for (key, value) in self.store.clone().iter(col) {
@@ -128,6 +157,10 @@ impl StoreValidator {
                     self.check(&validate::block_chunks_exist, &block_hash, &block, col);
                     // Chunks for current Block have Height Created not higher than Block Height
                     self.check(&validate::block_chunks_height_validity, &block_hash, &block, col);
+                    // BlockInfo for current Block exists
+                    self.check(&validate::block_info_exists, &block_hash, &block, col);
+                    // EpochInfo for current Epoch id of Block exists
+                    self.check(&validate::block_epoch_exists, &block_hash, &block, col);
                 }
                 DBCol::ColBlockHeight => {
                     let height = BlockHeight::try_from_slice(key_ref)?;
@@ -152,6 +185,15 @@ impl StoreValidator {
                         &shard_chunk,
                         col,
                     );
+                    // Check that all Txs in Chunk exist
+                    self.check(&validate::chunk_tx_exists, &chunk_hash, &shard_chunk, col);
+                    // Increase Tx Refcount for checking it later
+                    self.check(
+                        &validate::chunk_increase_tx_refcount,
+                        &chunk_hash,
+                        &shard_chunk,
+                        col,
+                    );
                 }
                 DBCol::ColTrieChanges => {
                     let (block_hash, shard_id) = get_block_shard_id_rev(key_ref)?;
@@ -169,6 +211,84 @@ impl StoreValidator {
                     let chunk_hashes = HashSet::<ChunkHash>::try_from_slice(value_ref)?;
                     // ShardChunk which can be indexed by Height exists
                     self.check(&validate::chunk_of_height_exists, &height, &chunk_hashes, col);
+                }
+                DBCol::ColOutcomesByBlockHash => {
+                    let block_hash = CryptoHash::try_from(key_ref)?;
+                    let outcome_ids = HashSet::<CryptoHash>::try_from_slice(value_ref)?;
+                    // TransactionResult which can be indexed by Outcome id exists
+                    self.check(
+                        &validate::outcome_by_outcome_id_exists,
+                        &block_hash,
+                        &outcome_ids,
+                        col,
+                    );
+                    // Block which can be indexed by Outcome block_hash exists
+                    self.check(&validate::outcome_id_block_exists, &block_hash, &outcome_ids, col);
+                }
+                DBCol::ColTransactionResult => {
+                    let outcome_id = CryptoHash::try_from_slice(key_ref)?;
+                    let outcome = ExecutionOutcomeWithIdAndProof::try_from_slice(value_ref)?;
+                    // Outcome is reachable in ColOutcomesByBlockHash
+                    self.check(
+                        &validate::outcome_indexed_by_block_hash,
+                        &outcome_id,
+                        &outcome,
+                        col,
+                    );
+                }
+                DBCol::ColStateDlInfos => {
+                    let block_hash = CryptoHash::try_from(key_ref)?;
+                    let state_sync_info = StateSyncInfo::try_from_slice(value_ref)?;
+                    // StateSyncInfo is valid
+                    self.check(
+                        &validate::state_sync_info_valid,
+                        &block_hash,
+                        &state_sync_info,
+                        col,
+                    );
+                    // Block which can be indexed by StateSyncInfo exists
+                    self.check(
+                        &validate::state_sync_info_block_exists,
+                        &block_hash,
+                        &state_sync_info,
+                        col,
+                    );
+                }
+                DBCol::ColBlockInfo => {
+                    let block_hash = CryptoHash::try_from(key_ref)?;
+                    let block_info = BlockInfo::try_from_slice(value_ref)?;
+                    // Block which can be indexed by BlockInfo exists
+                    self.check(&validate::block_info_block_exists, &block_hash, &block_info, col);
+                }
+                DBCol::ColEpochInfo => {
+                    if key_ref != AGGREGATOR_KEY {
+                        let epoch_id = EpochId::try_from_slice(key_ref)?;
+                        let epoch_info = EpochInfo::try_from_slice(value_ref)?;
+                        // Epoch should exist
+                        self.check(&validate::epoch_validity, &epoch_id, &epoch_info, col);
+                        // TODO #2893: Bowen which consistency we expect from ColEpochInfo?
+                    }
+                }
+                DBCol::ColEpochStart => {
+                    let _epoch_id = EpochId::try_from_slice(key_ref)?;
+                    let _epoch_start = BlockHeight::try_from_slice(value_ref)?;
+                    // TODO #2893: Bowen which consistency we expect from ColEpochStart?
+                }
+                DBCol::ColLastBlockWithNewChunk => {
+                    let shard_id = ShardId::try_from_slice(key_ref)?;
+                    let block_hash = CryptoHash::try_from(value_ref)?;
+                    // Block which is stored in ColLastBlockWithNewChunk exists and its ShardChunk is included
+                    self.check(&validate::last_block_chunk_included, &shard_id, &block_hash, col);
+                }
+                DBCol::ColGCCount => {
+                    let col = DBCol::try_from_slice(key_ref)?;
+                    let count = GCCount::try_from_slice(value_ref)?;
+                    self.check(&validate::gc_col_count, &col, &count, col);
+                }
+                DBCol::ColTransactionRefCount => {
+                    let tx_hash = CryptoHash::try_from(key_ref)?;
+                    let refcount = u64::try_from_slice(value_ref)?;
+                    self.check(&validate::tx_refcount, &tx_hash, &refcount, col);
                 }
                 _ => {}
             }
@@ -195,6 +315,14 @@ impl StoreValidator {
         // There is no more than one Block which Height is lower than Tail and not equal to Genesis
         if let Err(e) = validate::block_height_cmp_tail(self) {
             self.process_error(e, "TAIL", DBCol::ColBlockMisc)
+        }
+        // Check that all refs are counted
+        if let Err(e) = validate::tx_refcount_remaining(self) {
+            self.process_error(e, "TX_REFCOUNT", DBCol::ColTransactionRefCount)
+        }
+        // Check GC counters
+        if let Err(_) = validate::gc_col_count_total(self) {
+            // TODO #2861
         }
     }
 
